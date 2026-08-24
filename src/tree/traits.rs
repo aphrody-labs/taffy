@@ -290,6 +290,10 @@ pub trait RoundTree: TraverseTree {
     /// Get the nth out-of-flow box whose containing block is `node_id`
     /// (as recorded by [`LayoutContainingBlock::add_hoisted_children`])
     fn get_hoisted_child_id(&self, node_id: NodeId, index: usize) -> NodeId;
+    /// The step `round_layout` snaps to, as (x, y).
+    fn round_grid(&self) -> (f32, f32) {
+        (1.0, 1.0)
+    }
 }
 
 /// Trait used by the `print_tree` method which prints a debug representation

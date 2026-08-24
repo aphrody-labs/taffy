@@ -373,10 +373,28 @@ where
 /// In order to prevent innacuracies caused by rounding already-rounded values, we read from `unrounded_layout`
 /// and write to `final_layout`.
 pub fn round_layout(tree: &mut impl RoundTree, node_id: NodeId) {
-    return round_layout_inner(tree, node_id, 0.0, 0.0);
+    let (grid_x, grid_y) = tree.round_grid();
+    return round_layout_inner(tree, node_id, 0.0, 0.0, grid_x, grid_y);
+
+    #[must_use]
+    #[inline(always)]
+    fn snap(value: f32, step: f32) -> f32 {
+        if step <= 1.0 {
+            round(value)
+        } else {
+            (value / step).round() * step
+        }
+    }
 
     /// Recursive function to apply rounding to all descendents
-    fn round_layout_inner(tree: &mut impl RoundTree, node_id: NodeId, cumulative_x: f32, cumulative_y: f32) {
+    fn round_layout_inner(
+        tree: &mut impl RoundTree,
+        node_id: NodeId,
+        cumulative_x: f32,
+        cumulative_y: f32,
+        grid_x: f32,
+        grid_y: f32,
+    ) {
         let unrounded_layout = tree.get_unrounded_layout(node_id);
         let mut layout = unrounded_layout;
 
@@ -385,10 +403,10 @@ pub fn round_layout(tree: &mut impl RoundTree, node_id: NodeId) {
         let cumulative_x = cumulative_x + unrounded_layout.location.x;
         let cumulative_y = cumulative_y + unrounded_layout.location.y;
 
-        layout.location.x = round(cumulative_x) - round(parent_x);
-        layout.location.y = round(cumulative_y) - round(parent_y);
-        layout.size.width = round(cumulative_x + unrounded_layout.size.width) - round(cumulative_x);
-        layout.size.height = round(cumulative_y + unrounded_layout.size.height) - round(cumulative_y);
+        layout.location.x = snap(cumulative_x, grid_x) - snap(parent_x, grid_x);
+        layout.location.y = snap(cumulative_y, grid_y) - snap(parent_y, grid_y);
+        layout.size.width = snap(cumulative_x + unrounded_layout.size.width, grid_x) - snap(cumulative_x, grid_x);
+        layout.size.height = snap(cumulative_y + unrounded_layout.size.height, grid_y) - snap(cumulative_y, grid_y);
         layout.scrollbar_size.width = round(unrounded_layout.scrollbar_size.width);
         layout.scrollbar_size.height = round(unrounded_layout.scrollbar_size.height);
         layout.border.left = round(cumulative_x + unrounded_layout.border.left) - round(cumulative_x);
@@ -403,6 +421,25 @@ pub fn round_layout(tree: &mut impl RoundTree, node_id: NodeId) {
         layout.padding.top = round(cumulative_y + unrounded_layout.padding.top) - round(cumulative_y);
         layout.padding.bottom = round(cumulative_y + unrounded_layout.size.height)
             - round(cumulative_y + unrounded_layout.size.height - unrounded_layout.padding.bottom);
+
+        if grid_x > 1.0 || grid_y > 1.0 {
+            let far_x = cumulative_x + unrounded_layout.size.width;
+            let far_y = cumulative_y + unrounded_layout.size.height;
+            let inset = crate::geometry::Rect {
+                left: snap(cumulative_x + unrounded_layout.border.left + unrounded_layout.padding.left, grid_x)
+                    - snap(cumulative_x, grid_x),
+                right: snap(far_x, grid_x)
+                    - snap(far_x - unrounded_layout.border.right - unrounded_layout.padding.right, grid_x),
+                top: snap(cumulative_y + unrounded_layout.border.top + unrounded_layout.padding.top, grid_y)
+                    - snap(cumulative_y, grid_y),
+                bottom: snap(far_y, grid_y)
+                    - snap(far_y - unrounded_layout.border.bottom - unrounded_layout.padding.bottom, grid_y),
+            };
+            layout.padding.left = (inset.left - layout.border.left).max(0.0);
+            layout.padding.right = (inset.right - layout.border.right).max(0.0);
+            layout.padding.top = (inset.top - layout.border.top).max(0.0);
+            layout.padding.bottom = (inset.bottom - layout.border.bottom).max(0.0);
+        }
 
         #[cfg(feature = "content_size")]
         round_scrollable_overflow_rect(
@@ -422,7 +459,7 @@ pub fn round_layout(tree: &mut impl RoundTree, node_id: NodeId) {
         for index in 0..child_count {
             let child = tree.get_child_id(node_id, index);
             if !tree.is_out_of_flow(child) {
-                round_layout_inner(tree, child, cumulative_x, cumulative_y);
+                round_layout_inner(tree, child, cumulative_x, cumulative_y, grid_x, grid_y);
             }
         }
 
@@ -430,7 +467,7 @@ pub fn round_layout(tree: &mut impl RoundTree, node_id: NodeId) {
         let hoisted_count = tree.hoisted_child_count(node_id);
         for index in 0..hoisted_count {
             let child = tree.get_hoisted_child_id(node_id, index);
-            round_layout_inner(tree, child, cumulative_x, cumulative_y);
+            round_layout_inner(tree, child, cumulative_x, cumulative_y, grid_x, grid_y);
         }
     }
 
