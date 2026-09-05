@@ -660,7 +660,9 @@ fn compute_inner(
     // Root BFCs contain floats
     #[cfg(feature = "float_layout")]
     if block_ctx.is_bfc_root() || establishes_new_bfc {
-        intrinsic_outer_height = intrinsic_outer_height.max(block_ctx.floated_content_height_contribution());
+        intrinsic_outer_height = intrinsic_outer_height.max(
+            block_ctx.floated_content_height_contribution() + resolved_content_box_inset.bottom,
+        );
     }
 
     let container_outer_height = known_dimensions
@@ -911,6 +913,7 @@ fn generate_item_list(
 
             let is_in_same_bfc: bool = is_block
                 && !is_table
+                && !is_compressible_replaced
                 && !position.is_out_of_flow()
                 && is_not_floated
                 && !is_scroll_container
@@ -1440,9 +1443,16 @@ fn perform_final_layout_on_in_flow_children(
                 let insets = [inset_left, inset_right];
 
                 // Compute child layout. The child's position is estimated from its top margin collapsed with
-                // the preceding margins (the child's own collapsed-through margins are not yet known).
-                let estimated_y = committed_y_offset
-                    + active_collapsible_margin_set.collapse_with_margin(item_non_auto_margin.top).resolve();
+                // the preceding margins (the child's own collapsed-through margins are not yet known). This
+                // must match the child's final block position: a first-child margin that collapses through
+                // the container belongs outside this coordinate space, so it contributes nothing here.
+                let collapsed_top_margin =
+                    if is_collapsing_with_first_margin_set && own_margins_collapse_with_children.start {
+                        0.0
+                    } else {
+                        active_collapsible_margin_set.collapse_with_margin(item_non_auto_margin.top).resolve()
+                    };
+                let estimated_y = committed_y_offset + collapsed_top_margin;
                 let mut child_block_ctx = block_ctx.sub_context(estimated_y.max(clear_pos), insets);
                 let output = tree.compute_block_child_layout(item.node_id, inputs, Some(&mut child_block_ctx));
 
@@ -1821,4 +1831,45 @@ fn perform_final_layout_on_in_flow_children(
     committed_y_offset += resolved_content_box_inset.bottom + bottom_y_margin_offset;
     let content_height = f32_max(0.0, committed_y_offset);
     (inflow_overflow_rect, content_height, first_child_top_margin_set, last_child_bottom_margin_set, first_baseline)
+}
+
+#[cfg(test)]
+mod kitesurf_regression_tests {
+    use crate::prelude::*;
+    use crate::{Float, Point};
+
+    #[test]
+    fn block_replaced_item_avoids_floats() {
+        let mut tree: TaffyTree<()> = TaffyTree::new();
+        let floated = tree
+            .new_leaf(Style {
+                display: Display::Block,
+                float: Float::Left,
+                size: Size { width: length(120.0), height: length(100.0) },
+                ..Default::default()
+            })
+            .unwrap();
+        let replaced = tree
+            .new_leaf(Style {
+                display: Display::Block,
+                item_is_replaced: true,
+                size: Size { width: length(80.0), height: length(50.0) },
+                ..Default::default()
+            })
+            .unwrap();
+        let root = tree
+            .new_with_children(
+                Style {
+                    display: Display::Block,
+                    size: Size { width: length(200.0), height: auto() },
+                    ..Default::default()
+                },
+                &[floated, replaced],
+            )
+            .unwrap();
+
+        tree.compute_layout(root, Size::MAX_CONTENT).unwrap();
+
+        assert_eq!(tree.layout(replaced).unwrap().location, Point { x: 120.0, y: 0.0 });
+    }
 }
