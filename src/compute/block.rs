@@ -596,8 +596,9 @@ fn compute_inner(
     // 2. Compute container width
     let container_outer_width = known_dimensions.width.unwrap_or_else(|| {
         let available_width = available_space.width.maybe_sub(content_box_inset.horizontal_axis_sum());
-        let intrinsic_width = determine_content_based_container_width(tree, &items, available_width)
-            + content_box_inset.horizontal_axis_sum();
+        let intrinsic_width =
+            determine_content_based_container_width(tree, &items, available_width, container_content_box_size)
+                + content_box_inset.horizontal_axis_sum();
         intrinsic_width.maybe_clamp(min_size.width, max_size.width).maybe_max(Some(padding_border_size.width))
     });
 
@@ -1007,6 +1008,7 @@ fn determine_content_based_container_width(
     tree: &mut impl LayoutPartialTree,
     items: &[BlockItem],
     available_width: AvailableSpace,
+    parent_size: Size<Option<f32>>,
 ) -> f32 {
     let available_space = Size { width: available_width, height: AvailableSpace::MinContent };
 
@@ -1020,24 +1022,38 @@ fn determine_content_based_container_width(
             .margin
             .resolve_or_zero(available_space.width.into_option(), |val, basis| tree.calc(val, basis))
             .horizontal_axis_sum();
-        let width = known_dimensions.width.unwrap_or_else(|| {
-            let item_available_width =
-                match resolve_sizing_keyword(item.size_style.width, None, None, |val, basis| tree.calc(val, basis)) {
-                    Some(SizingKeywordResolution::Measure(available_width)) => available_width,
-                    Some(SizingKeywordResolution::Exact(width)) => AvailableSpace::Definite(width),
-                    None => available_space.width.maybe_sub(item_x_margin_sum),
-                };
-            tree.measure_child_size(
-                item.node_id,
-                known_dimensions,
-                Size::NONE,
-                Size { width: item_available_width, height: available_space.height },
-                SizingMode::InherentSize,
-                crate::AbsoluteAxis::Horizontal,
-                // Must match the value passed when laying the item out (see `Cache`)
-                if item.is_in_same_bfc { Line::TRUE } else { Line::FALSE },
-            )
-        });
+        // css-sizing-3 5.2.1: a compressible replaced element's percentage width is cyclic
+        // against the width this pass is computing, so it resolves against zero and the item
+        // contributes nothing. That also beats the width its aspect ratio and definite height
+        // imply (css-sizing-4 4.1: a specified size overrides the ratio), which lets an inline
+        // SVG chart with a viewBox shrink. A non-replaced element treats the same percentage as
+        // `auto` and still contributes its content, so it has to keep measuring.
+        let width = if item.is_compressible_replaced
+            && available_space.width == AvailableSpace::MinContent
+            && item.size_style.width.into_raw().uses_percentage()
+        {
+            0.0
+        } else {
+            known_dimensions.width.unwrap_or_else(|| {
+                let item_available_width =
+                    match resolve_sizing_keyword(item.size_style.width, None, None, |val, basis| tree.calc(val, basis))
+                    {
+                        Some(SizingKeywordResolution::Measure(available_width)) => available_width,
+                        Some(SizingKeywordResolution::Exact(width)) => AvailableSpace::Definite(width),
+                        None => available_space.width.maybe_sub(item_x_margin_sum),
+                    };
+                tree.measure_child_size(
+                    item.node_id,
+                    known_dimensions,
+                    parent_size,
+                    Size { width: item_available_width, height: available_space.height },
+                    SizingMode::InherentSize,
+                    crate::AbsoluteAxis::Horizontal,
+                    // Must match the value passed when laying the item out (see `Cache`)
+                    if item.is_in_same_bfc { Line::TRUE } else { Line::FALSE },
+                )
+            })
+        };
 
         let width = f32_max(width, item.padding_border_sum.width) + item_x_margin_sum;
 
