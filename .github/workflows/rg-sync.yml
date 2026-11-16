@@ -64,25 +64,26 @@ jobs:
 
       - name: Cherry-pick upstream fix PRs
         run: |
+          api() { for i in 1 2 3; do gh api "$@" && return 0; sleep 5; done; return 1; }
           touch .github/rg-applied-fixes.txt
-          gh api --paginate "repos/${UPSTREAM}/pulls?state=open&base=${BASE}&per_page=100" --jq '.[] | select(.draft|not) | .number' > prs.txt
+          api --paginate "repos/${UPSTREAM}/pulls?state=open&base=${BASE}&per_page=100" --jq '.[] | select(.draft|not) | .number' > prs.txt
           while read -r n; do
             [ -z "$n" ] && continue
             grep -q "^${n} " .github/rg-applied-fixes.txt && continue
-            info=$(gh api "repos/${UPSTREAM}/pulls/${n}")
+            info=$(api "repos/${UPSTREAM}/pulls/${n}") || continue
             echo "$info" | jq -e --arg re "$FIX_LABEL_RE" '[.labels[].name | select(test($re))] | length > 0' >/dev/null || continue
             head_sha=$(echo "$info" | jq -r .head.sha)
-            state=$(gh api "repos/${UPSTREAM}/commits/${head_sha}/status" --jq .state)
-            runs=$(gh api "repos/${UPSTREAM}/commits/${head_sha}/check-runs?per_page=100" --jq '[.check_runs[] | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral")] | length')
-            total=$(gh api "repos/${UPSTREAM}/commits/${head_sha}/check-runs?per_page=100" --jq '.total_count')
+            state=$(api "repos/${UPSTREAM}/commits/${head_sha}/status" --jq .state) || continue
+            runs=$(api "repos/${UPSTREAM}/commits/${head_sha}/check-runs?per_page=100" --jq '[.check_runs[] | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral")] | length') || continue
+            total=$(api "repos/${UPSTREAM}/commits/${head_sha}/check-runs?per_page=100" --jq '.total_count') || continue
             if [ "$runs" != "0" ] || [ "$total" = "0" ] || [ "$state" = "failure" ] || [ "$state" = "error" ]; then
               echo "PR ${n}: checks not green (runs_not_ok=${runs} total=${total} status=${state}), skipped"; continue
             fi
-            if gh api --paginate "repos/${UPSTREAM}/pulls/${n}/files" --jq '.[].filename' | grep -q '^\.github/workflows/'; then
+            if api --paginate "repos/${UPSTREAM}/pulls/${n}/files" --jq '.[].filename' | grep -q '^\.github/workflows/'; then
               echo "PR ${n}: touches workflows, skipped"; continue
             fi
             git fetch --no-tags upstream "pull/${n}/head:refs/rg/pr-${n}" || continue
-            commits=$(gh api --paginate "repos/${UPSTREAM}/pulls/${n}/commits" --jq '.[] | select((.parents|length)==1) | .sha')
+            commits=$(api --paginate "repos/${UPSTREAM}/pulls/${n}/commits" --jq '.[] | select((.parents|length)==1) | .sha') || continue
             before=$(git rev-parse HEAD); ok=1
             for c in $commits; do
               git cherry-pick -x --allow-empty --keep-redundant-commits "$c" >/dev/null 2>&1 || { git cherry-pick --abort 2>/dev/null; ok=0; break; }
