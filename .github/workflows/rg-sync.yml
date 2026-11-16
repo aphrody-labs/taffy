@@ -1,0 +1,108 @@
+# Rose Griffon fork maintenance: daily upstream sync, upstream fix PRs, our optimisations on top.
+# GitHub-hosted runner only; no compilation here (manifest sanity check only).
+name: rg-sync
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Compute everything, push nothing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rg-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: DioxusLabs/taffy
+  BASE: main
+  # Upstream PRs carrying one of these labels, not draft, mergeable and with every check green are cherry-picked.
+  FIX_LABEL_RE: '^bug$'
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Identity
+        run: |
+          git config user.name "rosegriffon-fork-sync"
+          git config user.email "fork-sync@users.noreply.github.com"
+
+      - name: Merge upstream main
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git fetch --no-tags upstream "${BASE}"
+          if git merge-base --is-ancestor "upstream/${BASE}" HEAD; then
+            echo "up to date with upstream"; exit 0
+          fi
+          if git merge --no-ff --no-commit "upstream/${BASE}"; then :; else
+            # Upstream workflow files are never taken: pushing them needs a workflow-scoped token
+            # and their CI is not ours. Everything else must merge cleanly.
+            git restore --source=HEAD --staged --worktree -- .github/workflows || true
+            if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+              git merge --abort
+              echo "::error::conflict merging upstream/${BASE}; resolve by hand"
+              git diff --name-only upstream/${BASE} | head
+              exit 1
+            fi
+          fi
+          git restore --source=HEAD --staged --worktree -- .github/workflows || true
+          git commit -m "Merge upstream ${UPSTREAM} ${BASE} ($(git rev-parse --short upstream/${BASE}))"
+
+      - name: Cherry-pick upstream fix PRs
+        run: |
+          touch .github/rg-applied-fixes.txt
+          gh api --paginate "repos/${UPSTREAM}/pulls?state=open&base=${BASE}&per_page=100" --jq '.[] | select(.draft|not) | .number' > prs.txt
+          while read -r n; do
+            [ -z "$n" ] && continue
+            grep -q "^${n} " .github/rg-applied-fixes.txt && continue
+            info=$(gh api "repos/${UPSTREAM}/pulls/${n}")
+            echo "$info" | jq -e --arg re "$FIX_LABEL_RE" '[.labels[].name | select(test($re))] | length > 0' >/dev/null || continue
+            head_sha=$(echo "$info" | jq -r .head.sha)
+            state=$(gh api "repos/${UPSTREAM}/commits/${head_sha}/status" --jq .state)
+            runs=$(gh api "repos/${UPSTREAM}/commits/${head_sha}/check-runs?per_page=100" --jq '[.check_runs[] | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral")] | length')
+            total=$(gh api "repos/${UPSTREAM}/commits/${head_sha}/check-runs?per_page=100" --jq '.total_count')
+            if [ "$runs" != "0" ] || [ "$total" = "0" ] || [ "$state" = "failure" ] || [ "$state" = "error" ]; then
+              echo "PR ${n}: checks not green (runs_not_ok=${runs} total=${total} status=${state}), skipped"; continue
+            fi
+            if gh api --paginate "repos/${UPSTREAM}/pulls/${n}/files" --jq '.[].filename' | grep -q '^\.github/workflows/'; then
+              echo "PR ${n}: touches workflows, skipped"; continue
+            fi
+            git fetch --no-tags upstream "pull/${n}/head:refs/rg/pr-${n}" || continue
+            commits=$(gh api --paginate "repos/${UPSTREAM}/pulls/${n}/commits" --jq '.[] | select((.parents|length)==1) | .sha')
+            before=$(git rev-parse HEAD); ok=1
+            for c in $commits; do
+              git cherry-pick -x --allow-empty --keep-redundant-commits "$c" >/dev/null 2>&1 || { git cherry-pick --abort 2>/dev/null; ok=0; break; }
+            done
+            if [ "$ok" = 1 ]; then
+              echo "${n} ${head_sha}" >> .github/rg-applied-fixes.txt
+              git add .github/rg-applied-fixes.txt
+              git commit -q -m "rg: record upstream fix PR ${UPSTREAM}#${n}"
+              echo "PR ${n}: applied"
+            else
+              git reset -q --hard "$(git rev-parse HEAD)"
+              echo "PR ${n}: conflicts, skipped"
+            fi
+          done < prs.txt
+
+      - name: Manifest sanity
+        run: cargo metadata --no-deps --format-version 1 > /dev/null
+
+      - name: Push
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git log --oneline "origin/${BASE}..HEAD" | head -50
+          git push origin "HEAD:${BASE}"

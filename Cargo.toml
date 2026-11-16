@@ -123,3 +123,11 @@ members = [
 # The Parley example and benches are excluded from the workspace as their dependencies require a newer
 # Rust version than Taffy's MSRV
 exclude = ["examples/parley", "benches"]
+
+# --- Rose Griffon optimisations (kept on top of upstream by .github/workflows/rg-sync.yml) ---
+[profile.rg-wasm]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
