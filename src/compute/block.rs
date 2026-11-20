@@ -641,8 +641,9 @@ fn compute_inner(
     // 2. Compute container width
     let container_outer_width = known_dimensions.width.unwrap_or_else(|| {
         let available_width = available_space.width.maybe_sub(content_box_inset.horizontal_axis_sum());
-        let intrinsic_width = determine_content_based_container_width(tree, &items, available_width)
-            + content_box_inset.horizontal_axis_sum();
+        let intrinsic_width =
+            determine_content_based_container_width(tree, &items, available_width, container_content_box_size)
+                + content_box_inset.horizontal_axis_sum();
         intrinsic_width.maybe_clamp(min_size.width, max_size.width).maybe_max(Some(padding_border_size.width))
     });
 
@@ -682,7 +683,7 @@ fn compute_inner(
         mut intrinsic_outer_height,
         first_child_top_margin_set,
         last_child_bottom_margin_set,
-        mut first_baseline,
+        mut baselines,
     ) = perform_final_layout_on_in_flow_children(
         tree,
         run_mode,
@@ -740,7 +741,8 @@ fn compute_inner(
         let inflow_content_height = intrinsic_outer_height - resolved_content_box_inset.vertical_axis_sum();
         let free_space = container_inner_height - inflow_content_height;
         let group_offset = compute_block_align_content_offset(align_content, free_space);
-        first_baseline = first_baseline.map(|baseline| baseline + group_offset);
+        baselines.first = baselines.first.map(|baseline| baseline + group_offset);
+        baselines.last = baselines.last.map(|baseline| baseline + group_offset);
         for item in items.iter_mut() {
             if let Some(layout) = item.final_layout.as_mut() {
                 layout.location.y += group_offset;
@@ -803,7 +805,7 @@ fn compute_inner(
         size: final_outer_size,
         #[cfg(feature = "content_size")]
         scrollable_overflow_rect: crate::tree::ScrollableOverflow::ZERO,
-        baselines: Baselines::from_first(first_baseline),
+        baselines,
         top_margin: if own_margins_collapse_with_children.start {
             first_child_top_margin_set
         } else {
@@ -978,6 +980,7 @@ fn generate_item_list(
 
             let is_in_same_bfc: bool = is_block
                 && !is_table
+                && !is_compressible_replaced
                 && !position.is_out_of_flow()
                 && is_not_floated
                 && !is_scroll_container
@@ -1096,6 +1099,7 @@ fn determine_content_based_container_width(
     tree: &mut impl LayoutPartialTree,
     items: &[BlockItem],
     available_width: AvailableSpace,
+    parent_size: Size<Option<f32>>,
 ) -> f32 {
     let available_space = Size { width: available_width, height: AvailableSpace::MinContent };
 
@@ -1109,33 +1113,47 @@ fn determine_content_based_container_width(
             .margin
             .resolve_or_zero(available_space.width.into_option(), |val, basis| tree.calc(val, basis))
             .horizontal_axis_sum();
-        let width = known_dimensions.width.unwrap_or_else(|| {
-            let item_available_width =
-                match resolve_sizing_keyword(item.size_style.width, None, None, |val, basis| tree.calc(val, basis)) {
-                    Some(SizingKeywordResolution::Measure(available_width)) => available_width,
-                    Some(SizingKeywordResolution::Exact(width)) => AvailableSpace::Definite(width),
-                    None => available_space.width.maybe_sub(item_x_margin_sum),
-                };
-            let width = tree.measure_child_size(
-                item.node_id,
-                known_dimensions,
-                Size::NONE,
-                Size { width: item_available_width, height: available_space.height },
-                SizingMode::InherentSize,
-                crate::AbsoluteAxis::Horizontal,
-                // Must match the value passed when laying the item out (see `Cache`)
-                if item.is_in_same_bfc { Line::TRUE } else { Line::FALSE },
-            );
-            // The cap is the item's min-content contribution, so its fit-content contribution is
-            // min(max-content, max(cap, available))
-            match (item.min_content_width_cap, item_available_width) {
-                (Some(cap), AvailableSpace::MinContent) => width.min(cap).maybe_max(item.min_size.width),
-                (Some(cap), AvailableSpace::Definite(available)) => {
-                    width.min(cap.max(available)).maybe_max(item.min_size.width)
+        // css-sizing-3 5.2.1: a compressible replaced element's percentage width is cyclic
+        // against the width this pass is computing, so it resolves against zero and the item
+        // contributes nothing. That also beats the width its aspect ratio and definite height
+        // imply (css-sizing-4 4.1: a specified size overrides the ratio), which lets an inline
+        // SVG chart with a viewBox shrink. A non-replaced element treats the same percentage as
+        // `auto` and still contributes its content, so it has to keep measuring.
+        let width = if item.is_compressible_replaced
+            && available_space.width == AvailableSpace::MinContent
+            && item.size_style.width.into_raw().uses_percentage()
+        {
+            0.0
+        } else {
+            known_dimensions.width.unwrap_or_else(|| {
+                let item_available_width =
+                    match resolve_sizing_keyword(item.size_style.width, None, None, |val, basis| tree.calc(val, basis))
+                    {
+                        Some(SizingKeywordResolution::Measure(available_width)) => available_width,
+                        Some(SizingKeywordResolution::Exact(width)) => AvailableSpace::Definite(width),
+                        None => available_space.width.maybe_sub(item_x_margin_sum),
+                    };
+                let width = tree.measure_child_size(
+                    item.node_id,
+                    known_dimensions,
+                    parent_size,
+                    Size { width: item_available_width, height: available_space.height },
+                    SizingMode::InherentSize,
+                    crate::AbsoluteAxis::Horizontal,
+                    // Must match the value passed when laying the item out (see `Cache`)
+                    if item.is_in_same_bfc { Line::TRUE } else { Line::FALSE },
+                );
+                // The cap is the item's min-content contribution, so its fit-content contribution is
+                // min(max-content, max(cap, available))
+                match (item.min_content_width_cap, item_available_width) {
+                    (Some(cap), AvailableSpace::MinContent) => width.min(cap).maybe_max(item.min_size.width),
+                    (Some(cap), AvailableSpace::Definite(available)) => {
+                        width.min(cap.max(available)).maybe_max(item.min_size.width)
+                    }
+                    _ => width,
                 }
-                _ => width,
-            }
-        });
+            })
+        };
 
         let width = f32_max(width, item.padding_border_sum.width) + item_x_margin_sum;
 
@@ -1245,7 +1263,7 @@ fn perform_final_layout_on_in_flow_children<Tree: LayoutBlockContainer>(
     children_margins_adjoin_own_edges: Line<bool>,
     #[cfg(feature = "content_size")] is_scroll_container: bool,
     block_ctx: &mut BlockContext<'_>,
-) -> (Rect<f32>, f32, CollapsibleMarginSet, CollapsibleMarginSet, Option<f32>) {
+) -> (Rect<f32>, f32, CollapsibleMarginSet, CollapsibleMarginSet, Baselines) {
     // Resolve container_inner_width for sizing child nodes using initial content_box_inset
     let container_inner_width = (container_outer_width - resolved_content_box_inset.horizontal_axis_sum()).max(0.0);
     #[cfg(feature = "content_size")]
@@ -1294,6 +1312,7 @@ fn perform_final_layout_on_in_flow_children<Tree: LayoutBlockContainer>(
     let mut active_collapsible_margin_set = CollapsibleMarginSet::ZERO;
     let mut is_collapsing_with_first_margin_set = true;
     let mut first_baseline: Option<f32> = None;
+    let mut last_baseline: Option<f32> = None;
     // Whether the active margin set contains the margins of a self-collapsing element with
     // clearance. Such margins collapse with the margins of following siblings but the resulting
     // margin does not collapse with the bottom margin of the parent block.
@@ -1598,9 +1617,16 @@ fn perform_final_layout_on_in_flow_children<Tree: LayoutBlockContainer>(
                 let insets = FloatInsets::new(inset_left, inset_right);
 
                 // Compute child layout. The child's position is estimated from its top margin collapsed with
-                // the preceding margins (the child's own collapsed-through margins are not yet known).
-                let estimated_y = committed_y_offset
-                    + active_collapsible_margin_set.collapse_with_margin(item_non_auto_margin.top).resolve();
+                // the preceding margins (the child's own collapsed-through margins are not yet known). This
+                // must match the child's final block position: a first-child margin that collapses through
+                // the container belongs outside this coordinate space, so it contributes nothing here.
+                let collapsed_top_margin =
+                    if is_collapsing_with_first_margin_set && own_margins_collapse_with_children.start {
+                        0.0
+                    } else {
+                        active_collapsible_margin_set.collapse_with_margin(item_non_auto_margin.top).resolve()
+                    };
+                let estimated_y = committed_y_offset + collapsed_top_margin;
                 let mut child_block_ctx = block_ctx.sub_context(estimated_y.max(clear_pos), insets);
                 let output = tree.compute_block_child_layout(item.node_id, inputs, Some(&mut child_block_ctx));
 
@@ -1827,6 +1853,27 @@ fn perform_final_layout_on_in_flow_children<Tree: LayoutBlockContainer>(
                 first_baseline = child_baseline.map(|baseline| location.y - inset_offset.y + baseline);
             }
 
+            // The last baseline is the last baseline of the last in-flow child that has
+            // one, with the same scroll-container treatment. An inline-block takes its baseline
+            // from its last line box (CSS2 §10.8.1), so without it an inline-block whose lines sit
+            // in a block child aligned on its first line.
+            let child_last_baseline = if item.overflow.y.is_scroll_container() {
+                Some(
+                    item_layout
+                        .baselines
+                        .last
+                        .or(item_layout.baselines.first)
+                        .unwrap_or(item_layout.size.height)
+                        .min(item_layout.size.height)
+                        .max(0.0),
+                )
+            } else {
+                item_layout.baselines.last.or(item_layout.baselines.first)
+            };
+            if let Some(baseline) = child_last_baseline {
+                last_baseline = Some(location.y + baseline);
+            }
+
             // Used auto margins include float-avoidance offsets, unlike the alignment margins above.
             #[cfg(feature = "float_layout")]
             let resolved_margin = {
@@ -1947,5 +1994,52 @@ fn perform_final_layout_on_in_flow_children<Tree: LayoutBlockContainer>(
 
     committed_y_offset += resolved_content_box_inset.bottom + bottom_y_margin_offset;
     let content_height = f32_max(0.0, committed_y_offset);
-    (inflow_overflow_rect, content_height, first_child_top_margin_set, last_child_bottom_margin_set, first_baseline)
+    (
+        inflow_overflow_rect,
+        content_height,
+        first_child_top_margin_set,
+        last_child_bottom_margin_set,
+        Baselines { first: first_baseline, last: last_baseline },
+    )
+}
+
+#[cfg(test)]
+mod kitesurf_regression_tests {
+    use crate::prelude::*;
+    use crate::{Float, Point};
+
+    #[test]
+    fn block_replaced_item_avoids_floats() {
+        let mut tree: TaffyTree<()> = TaffyTree::new();
+        let floated = tree
+            .new_leaf(Style {
+                display: Display::Block,
+                float: Float::Left,
+                size: Size { width: length(120.0), height: length(100.0) },
+                ..Default::default()
+            })
+            .unwrap();
+        let replaced = tree
+            .new_leaf(Style {
+                display: Display::Block,
+                item_is_replaced: true,
+                size: Size { width: length(80.0), height: length(50.0) },
+                ..Default::default()
+            })
+            .unwrap();
+        let root = tree
+            .new_with_children(
+                Style {
+                    display: Display::Block,
+                    size: Size { width: length(200.0), height: auto() },
+                    ..Default::default()
+                },
+                &[floated, replaced],
+            )
+            .unwrap();
+
+        tree.compute_layout(root, Size::MAX_CONTENT).unwrap();
+
+        assert_eq!(tree.layout(replaced).unwrap().location, Point { x: 120.0, y: 0.0 });
+    }
 }

@@ -441,6 +441,30 @@ fn compute_preliminary(tree: &mut impl LayoutFlexboxContainer, node: NodeId, inp
             .maybe_resolve(inner_container_size, |val, basis| tree.calc(val, basis))
             .unwrap_or(0.0);
         constants.gap.set_main(constants.dir, new_gap);
+
+        // The lines above were collected against the container's available space, which
+        // for a content-determined main size is a min-content probe. A wrapping container
+        // then gets one item per line, and every later step would lay it out that way. Recollect against the main size that probe just produced.
+        if constants.is_wrap {
+            let resolved_available_space = available_space.with_main(
+                constants.dir,
+                AvailableSpace::Definite(constants.inner_container_size.main(constants.dir)),
+            );
+            // The lines borrow flex_items, so they have to go before the recollect.
+            drop(flex_lines);
+            #[cfg(feature = "flexbox_balance")]
+            {
+                flex_lines = if constants.is_balance {
+                    collect_balanced_flex_lines(&constants, resolved_available_space, &mut flex_items)
+                } else {
+                    collect_flex_lines(&constants, resolved_available_space, &mut flex_items)
+                };
+            }
+            #[cfg(not(feature = "flexbox_balance"))]
+            {
+                flex_lines = collect_flex_lines(&constants, resolved_available_space, &mut flex_items);
+            }
+        }
     }
 
     // If only the container's main size has been requested then we are done, as nothing below changes it. This
@@ -1487,6 +1511,13 @@ fn determine_container_main_size(
     let outer_main_size: f32 = constants.node_outer_size.main(constants.dir).unwrap_or_else(|| {
         match available_space.main(dir) {
             AvailableSpace::Definite(main_axis_available_space) => {
+                // This function returns an outer main size, but `available_space` has already
+                // been shrunk to the container's content box (`determine_available_space`), so
+                // every stretch-fit below has to add the inset back. Without it, a wrapping
+                // container with padding settles one inset short of the space its lines fill:
+                // 260px for a 300px line with 20px of side padding, where Chrome and Firefox
+                // both give 300px.
+                let outer_main_axis_available_space = main_axis_available_space + main_content_box_inset;
                 let main_axis_gap = constants.gap.main(constants.dir);
                 let item_main_length = |child: &FlexItem| {
                     let padding_border_sum = (child.padding + child.border).main_axis_sum(constants.dir);
@@ -1537,11 +1568,11 @@ fn determine_container_main_size(
                         index += count;
                     }
                     let max_content_size = widest_line_length + main_content_box_inset;
-                    return f32_max(size, f32_min(max_content_size, main_axis_available_space));
+                    return f32_max(size, f32_min(max_content_size, outer_main_axis_available_space));
                 }
 
                 if lines.len() > 1 {
-                    f32_max(size, main_axis_available_space)
+                    f32_max(size, outer_main_axis_available_space)
                 } else {
                     size
                 }
