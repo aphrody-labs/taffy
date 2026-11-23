@@ -16,11 +16,12 @@ The MSRV is now 1.85.
 - Float: a zero-height float is now recorded in the float context, so content and boxes establishing a new block formatting context whose vertical extent crosses its position avoid it. Previously it only affected `clear` and the position of later floats.
 - Block: when a block with no top border or padding has a bottom border or padding, the margins of leading children that collapse through it (and so collapse with its own top margin) are no longer also added to its height. Previously such a block was too tall by the collapsed margin.
 - Block: the min-content contribution of a compressible replaced child (e.g. an image) with a percentage `width` or `max-width` now resolves that percentage against zero, so a shrink-to-fit block (e.g. an `inline-block` or float) holding a `width: 100%` image is capped by the available width rather than growing to the image's natural width.
+- Block/float: a box that establishes a new block formatting context (e.g. `overflow: hidden` or `display: flow-root`) beside floats now avoids the floats beside its laid-out height, not only those beside its styled (minimum) height. It is narrowed to the space beside the floats it reaches, or moved down to the next slot if it doesn't fit there.
 
 ### Changes
 
 - Upgrade `cssparser` to 0.38 (used by the `parse` feature). Parse error messages no longer name the offending token, as cssparser no longer stores it.
-- The `strict_provenance` feature is now a no-op: `CompactLength` always uses the strict provenance pointer APIs (stable since Rust 1.84).
+- Removed the `strict_provenance` feature: `CompactLength` always uses the strict provenance pointer APIs (stable since Rust 1.84).
 - `Cache` no longer implements `Serialize` when the `serde` feature is enabled.
 - `CacheTree::cache_get` and `Cache::get` now take `&self` rather than `&mut self`. `Cache` stores its measure-entry eviction clock in an `AtomicU16` (updated with relaxed loads and stores) so that a cache hit can record the entry as recently used through a shared reference.
 - Replace raw scrollable overflow rectangles in `Layout` and `LayoutOutput` with `ScrollableOverflow`, including physical reversed-scroll-origin flags and sign-restored `left()`, `right()`, `top()`, and `bottom()` accessors. Flex reverse directions and wrap-reverse now retain reachable negative overflow, while scroll containers clip unreachable overflow.
@@ -28,6 +29,7 @@ The MSRV is now 1.85.
 - `BlockContext::find_content_slot` (and `FloatContext::find_content_slot`) now take the `height` of the content to be placed, and avoid the floats beside any part of that height rather than only those at its top edge. The returned `ContentSlot::height` is now how far down the slot's width stays valid (previously always infinite).
 - Add `FloatDirection::opposite` and a public `FloatInsets` type (`left`/`right`), which replaces the `[f32; 2]` insets and margins taken by `BlockContext::sub_context`, `BlockContext::apply_content_box_inset`, `BlockContext::find_bfc_slot` and the `FloatContext` placement methods.
 - `BfcSlot` (returned by `BlockContext::find_bfc_slot` and `FloatContext::find_bfc_slot`) has a new `height` field: how far down from its top the slot's widths stay valid. A box taller than this may be beside further floats.
+- BREAKING: `calc()` values are now stored as a `CalcHandle` instead of a `*const ()`. `CompactLength::calc`, `LengthPercentage::calc`, `Dimension::calc` (and the other `calc`/`fit_content_calc` constructors) take a `CalcHandle`, `calc_value()` and the `Expanded*::Calc` variants return one, and `LayoutPartialTree::resolve_calc_value` (and every calc resolver closure) receives one. Create a handle with `CalcHandle::from_ptr` or `CalcHandle::from_bits` and read it back with `ptr()` or `to_bits()`. Integer handles now have the same 61 bits available on 32-bit targets as on 64-bit targets (previously 32-bit targets were limited to a 32-bit pointer) (#1399).
 
 ## 0.15.1
 
